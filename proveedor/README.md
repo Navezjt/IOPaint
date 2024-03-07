@@ -1,1 +1,2 @@
-https://github.com/Sanster/lama-cleaner
+- https://github.com/Sanster/lama-cleaner
+- https://github.com/Navezjt/models
