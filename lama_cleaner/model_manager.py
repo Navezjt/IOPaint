@@ -1,39 +1,14 @@
+from typing import List, Dict
+
 import torch
-import gc
-
 from loguru import logger
+import numpy as np
 
-from lama_cleaner.const import SD15_MODELS
-from lama_cleaner.helper import switch_mps_device
-from lama_cleaner.model.controlnet import ControlNet
-from lama_cleaner.model.fcf import FcF
-from lama_cleaner.model.lama import LaMa
-from lama_cleaner.model.ldm import LDM
-from lama_cleaner.model.manga import Manga
-from lama_cleaner.model.mat import MAT
-from lama_cleaner.model.paint_by_example import PaintByExample
-from lama_cleaner.model.instruct_pix2pix import InstructPix2Pix
-from lama_cleaner.model.sd import SD15, SD2, Anything4, RealisticVision14
-from lama_cleaner.model.utils import torch_gc
-from lama_cleaner.model.zits import ZITS
-from lama_cleaner.model.opencv2 import OpenCV2
-from lama_cleaner.schema import Config
-
-models = {
-    "lama": LaMa,
-    "ldm": LDM,
-    "zits": ZITS,
-    "mat": MAT,
-    "fcf": FcF,
-    SD15.name: SD15,
-    Anything4.name: Anything4,
-    RealisticVision14.name: RealisticVision14,
-    "cv2": OpenCV2,
-    "manga": Manga,
-    "sd2": SD2,
-    "paint_by_example": PaintByExample,
-    "instruct_pix2pix": InstructPix2Pix,
-}
+from iopaint.download import scan_models
+from iopaint.helper import switch_mps_device
+from iopaint.model import models, ControlNet, SD, SDXL
+from iopaint.model.utils import torch_gc, is_local_files_only
+from iopaint.schema import InpaintRequest, ModelInfo, ModelType
 
 
 class ModelManager:
@@ -41,78 +16,181 @@ class ModelManager:
         self.name = name
         self.device = device
         self.kwargs = kwargs
+        self.available_models: Dict[str, ModelInfo] = {}
+        self.scan_models()
+
+        self.enable_controlnet = kwargs.get("enable_controlnet", False)
+        controlnet_method = kwargs.get("controlnet_method", None)
+        if (
+            controlnet_method is None
+            and name in self.available_models
+            and self.available_models[name].support_controlnet
+        ):
+            controlnet_method = self.available_models[name].controlnets[0]
+        self.controlnet_method = controlnet_method
         self.model = self.init_model(name, device, **kwargs)
 
+    @property
+    def current_model(self) -> ModelInfo:
+        return self.available_models[self.name]
+
     def init_model(self, name: str, device, **kwargs):
-        if name in SD15_MODELS and kwargs.get("sd_controlnet", False):
-            return ControlNet(device, **{**kwargs, "name": name})
+        logger.info(f"Loading model: {name}")
+        if name not in self.available_models:
+            raise NotImplementedError(
+                f"Unsupported model: {name}. Available models: {list(self.available_models.keys())}"
+            )
 
-        if name in models:
-            model = models[name](device, **kwargs)
+        model_info = self.available_models[name]
+        kwargs = {
+            **kwargs,
+            "model_info": model_info,
+            "enable_controlnet": self.enable_controlnet,
+            "controlnet_method": self.controlnet_method,
+        }
+
+        if model_info.support_controlnet and self.enable_controlnet:
+            return ControlNet(device, **kwargs)
+        elif model_info.name in models:
+            return models[name](device, **kwargs)
         else:
-            raise NotImplementedError(f"Not supported model: {name}")
-        return model
+            if model_info.model_type in [
+                ModelType.DIFFUSERS_SD_INPAINT,
+                ModelType.DIFFUSERS_SD,
+            ]:
+                return SD(device, **kwargs)
 
-    def is_downloaded(self, name: str) -> bool:
-        if name in models:
-            return models[name].is_downloaded()
-        else:
-            raise NotImplementedError(f"Not supported model: {name}")
+            if model_info.model_type in [
+                ModelType.DIFFUSERS_SDXL_INPAINT,
+                ModelType.DIFFUSERS_SDXL,
+            ]:
+                return SDXL(device, **kwargs)
 
-    def __call__(self, image, mask, config: Config):
-        self.switch_controlnet_method(control_method=config.controlnet_method)
-        return self.model(image, mask, config)
+        raise NotImplementedError(f"Unsupported model: {name}")
 
-    def switch(self, new_name: str, **kwargs):
+    @torch.inference_mode()
+    def __call__(self, image, mask, config: InpaintRequest):
+        """
+
+        Args:
+            image: [H, W, C] RGB
+            mask: [H, W, 1] 255 means area to repaint
+            config:
+
+        Returns:
+            BGR image
+        """
+        self.switch_controlnet_method(config)
+        self.enable_disable_freeu(config)
+        self.enable_disable_lcm_lora(config)
+        return self.model(image, mask, config).astype(np.uint8)
+
+    def scan_models(self) -> List[ModelInfo]:
+        available_models = scan_models()
+        self.available_models = {it.name: it for it in available_models}
+        return available_models
+
+    def switch(self, new_name: str):
         if new_name == self.name:
             return
+
+        old_name = self.name
+        old_controlnet_method = self.controlnet_method
+        self.name = new_name
+
+        if (
+            self.available_models[new_name].support_controlnet
+            and self.controlnet_method
+            not in self.available_models[new_name].controlnets
+        ):
+            self.controlnet_method = self.available_models[new_name].controlnets[0]
         try:
-            if torch.cuda.memory_allocated() > 0:
-                # Clear current loaded model from memory
-                torch.cuda.empty_cache()
-                del self.model
-                gc.collect()
+            # TODO: enable/disable controlnet without reload model
+            del self.model
+            torch_gc()
 
             self.model = self.init_model(
                 new_name, switch_mps_device(new_name, self.device), **self.kwargs
             )
-            self.name = new_name
-        except NotImplementedError as e:
+        except Exception as e:
+            self.name = old_name
+            self.controlnet_method = old_controlnet_method
+            logger.info(f"Switch model from {old_name} to {new_name} failed, rollback")
+            self.model = self.init_model(
+                old_name, switch_mps_device(old_name, self.device), **self.kwargs
+            )
             raise e
 
-    def switch_controlnet_method(self, control_method: str):
-        if not self.kwargs.get("sd_controlnet"):
-            return
-        if self.kwargs["sd_controlnet_method"] == control_method:
-            return
-        if not hasattr(self.model, "is_local_sd_model"):
+    def switch_controlnet_method(self, config):
+        if not self.available_models[self.name].support_controlnet:
             return
 
-        if self.model.is_local_sd_model:
-            # is_native_control_inpaint 表示加载了普通 SD 模型
-            if (
-                self.model.is_native_control_inpaint
-                and control_method != "control_v11p_sd15_inpaint"
-            ):
-                raise RuntimeError(
-                    f"--sd-local-model-path load a normal SD model, "
-                    f"to use {control_method} you should load an inpainting SD model"
+        if (
+            self.enable_controlnet
+            and config.controlnet_method
+            and self.controlnet_method != config.controlnet_method
+        ):
+            old_controlnet_method = self.controlnet_method
+            self.controlnet_method = config.controlnet_method
+            self.model.switch_controlnet_method(config.controlnet_method)
+            logger.info(
+                f"Switch Controlnet method from {old_controlnet_method} to {config.controlnet_method}"
+            )
+        elif self.enable_controlnet != config.enable_controlnet:
+            self.enable_controlnet = config.enable_controlnet
+            self.controlnet_method = config.controlnet_method
+
+            pipe_components = {
+                "vae": self.model.model.vae,
+                "text_encoder": self.model.model.text_encoder,
+                "unet": self.model.model.unet,
+            }
+            if hasattr(self.model.model, "text_encoder_2"):
+                pipe_components["text_encoder_2"] = self.model.model.text_encoder_2
+
+            self.model = self.init_model(
+                self.name,
+                switch_mps_device(self.name, self.device),
+                pipe_components=pipe_components,
+                **self.kwargs,
+            )
+            if not config.enable_controlnet:
+                logger.info(f"Disable controlnet")
+            else:
+                logger.info(f"Enable controlnet: {config.controlnet_method}")
+
+    def enable_disable_freeu(self, config: InpaintRequest):
+        if str(self.model.device) == "mps":
+            return
+
+        if self.available_models[self.name].support_freeu:
+            if config.sd_freeu:
+                freeu_config = config.sd_freeu_config
+                self.model.model.enable_freeu(
+                    s1=freeu_config.s1,
+                    s2=freeu_config.s2,
+                    b1=freeu_config.b1,
+                    b2=freeu_config.b2,
                 )
-            elif (
-                not self.model.is_native_control_inpaint
-                and control_method == "control_v11p_sd15_inpaint"
-            ):
-                raise RuntimeError(
-                    f"--sd-local-model-path load an inpainting SD model, "
-                    f"to use {control_method} you should load a norml SD model"
-                )
+            else:
+                self.model.model.disable_freeu()
 
-        del self.model
-        torch_gc()
-
-        old_method = self.kwargs["sd_controlnet_method"]
-        self.kwargs["sd_controlnet_method"] = control_method
-        self.model = self.init_model(
-            self.name, switch_mps_device(self.name, self.device), **self.kwargs
-        )
-        logger.info(f"Switch ControlNet method from {old_method} to {control_method}")
+    def enable_disable_lcm_lora(self, config: InpaintRequest):
+        if self.available_models[self.name].support_lcm_lora:
+            # TODO: change this if load other lora is supported
+            lcm_lora_loaded = bool(self.model.model.get_list_adapters())
+            if config.sd_lcm_lora:
+                if not lcm_lora_loaded:
+                    logger.info("Load LCM LORA")
+                    self.model.model.load_lora_weights(
+                        self.model.lcm_lora_id,
+                        weight_name="pytorch_lora_weights.safetensors",
+                        local_files_only=is_local_files_only(),
+                    )
+                else:
+                    logger.info("Enable LCM LORA")
+                    self.model.model.enable_lora()
+            else:
+                if lcm_lora_loaded:
+                    logger.info("Disable LCM LORA")
+                    self.model.model.disable_lora()

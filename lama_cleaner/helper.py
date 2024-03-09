@@ -1,14 +1,16 @@
+import base64
+import imghdr
 import io
 import os
 import sys
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 
 from urllib.parse import urlparse
 import cv2
 from PIL import Image, ImageOps, PngImagePlugin
 import numpy as np
 import torch
-from lama_cleaner.const import MPS_SUPPORT_MODELS
+from iopaint.const import MPS_UNSUPPORT_MODELS
 from loguru import logger
 from torch.hub import download_url_to_file, get_dir
 import hashlib
@@ -23,7 +25,7 @@ def md5sum(filename):
 
 
 def switch_mps_device(model_name, device):
-    if model_name not in MPS_SUPPORT_MODELS and str(device) == "mps":
+    if model_name in MPS_UNSUPPORT_MODELS and str(device) == "mps":
         logger.info(f"{model_name} not support mps, switch to cpu")
         return torch.device("cpu")
     return device
@@ -41,7 +43,10 @@ def get_cache_path_by_url(url):
 
 
 def download_model(url, model_md5: str = None):
-    cached_file = get_cache_path_by_url(url)
+    if os.path.exists(url):
+        cached_file = url
+    else:
+        cached_file = get_cache_path_by_url(url)
     if not os.path.exists(cached_file):
         sys.stderr.write('Downloading: "{}" to {}\n'.format(url, cached_file))
         hash_prefix = None
@@ -54,12 +59,12 @@ def download_model(url, model_md5: str = None):
                 try:
                     os.remove(cached_file)
                     logger.error(
-                        f"Model md5: {_md5}, expected md5: {model_md5}, wrong model deleted. Please restart lama-cleaner."
+                        f"Model md5: {_md5}, expected md5: {model_md5}, wrong model deleted. Please restart iopaint."
                         f"If you still have errors, please try download model manually first https://lama-cleaner-docs.vercel.app/install/download_model_manually.\n"
                     )
                 except:
                     logger.error(
-                        f"Model md5: {_md5}, expected md5: {model_md5}, please delete {cached_file} and restart lama-cleaner."
+                        f"Model md5: {_md5}, expected md5: {model_md5}, please delete {cached_file} and restart iopaint."
                     )
                 exit(-1)
 
@@ -78,12 +83,12 @@ def handle_error(model_path, model_md5, e):
         try:
             os.remove(model_path)
             logger.error(
-                f"Model md5: {_md5}, expected md5: {model_md5}, wrong model deleted. Please restart lama-cleaner."
+                f"Model md5: {_md5}, expected md5: {model_md5}, wrong model deleted. Please restart iopaint."
                 f"If you still have errors, please try download model manually first https://lama-cleaner-docs.vercel.app/install/download_model_manually.\n"
             )
         except:
             logger.error(
-                f"Model md5: {_md5}, expected md5: {model_md5}, please delete {model_path} and restart lama-cleaner."
+                f"Model md5: {_md5}, expected md5: {model_md5}, please delete {model_path} and restart iopaint."
             )
     else:
         logger.error(
@@ -135,31 +140,27 @@ def numpy_to_bytes(image_numpy: np.ndarray, ext: str) -> bytes:
     return image_bytes
 
 
-def pil_to_bytes(pil_img, ext: str, quality: int = 95, exif_infos={}) -> bytes:
+def pil_to_bytes(pil_img, ext: str, quality: int = 95, infos={}) -> bytes:
     with io.BytesIO() as output:
-        kwargs = {k: v for k, v in exif_infos.items() if v is not None}
-        if ext == "png" and "parameters" in kwargs:
+        kwargs = {k: v for k, v in infos.items() if v is not None}
+        if ext == "jpg":
+            ext = "jpeg"
+        if "png" == ext.lower() and "parameters" in kwargs:
             pnginfo_data = PngImagePlugin.PngInfo()
             pnginfo_data.add_text("parameters", kwargs["parameters"])
             kwargs["pnginfo"] = pnginfo_data
 
-        pil_img.save(
-            output,
-            format=ext,
-            quality=quality,
-            **kwargs,
-        )
+        pil_img.save(output, format=ext, quality=quality, **kwargs)
         image_bytes = output.getvalue()
     return image_bytes
 
 
-def load_img(img_bytes, gray: bool = False, return_exif: bool = False):
+def load_img(img_bytes, gray: bool = False, return_info: bool = False):
     alpha_channel = None
     image = Image.open(io.BytesIO(img_bytes))
 
-    if return_exif:
-        info = image.info or {}
-        exif_infos = {"exif": image.getexif(), "parameters": info.get("parameters")}
+    if return_info:
+        infos = image.info
 
     try:
         image = ImageOps.exif_transpose(image)
@@ -178,8 +179,8 @@ def load_img(img_bytes, gray: bool = False, return_exif: bool = False):
             image = image.convert("RGB")
             np_img = np.array(image)
 
-    if return_exif:
-        return np_img, alpha_channel, exif_infos
+    if return_info:
+        return np_img, alpha_channel, infos
     return np_img, alpha_channel
 
 
@@ -290,3 +291,118 @@ def only_keep_largest_contour(mask: np.ndarray) -> List[np.ndarray]:
         return cv2.drawContours(new_mask, contours, max_index, 255, -1)
     else:
         return mask
+
+
+def is_mac():
+    return sys.platform == "darwin"
+
+
+def get_image_ext(img_bytes):
+    w = imghdr.what("", img_bytes)
+    if w is None:
+        w = "jpeg"
+    return w
+
+
+def decode_base64_to_image(
+    encoding: str, gray=False
+) -> Tuple[np.array, Optional[np.array], Dict]:
+    if encoding.startswith("data:image/") or encoding.startswith(
+        "data:application/octet-stream;base64,"
+    ):
+        encoding = encoding.split(";")[1].split(",")[1]
+    image = Image.open(io.BytesIO(base64.b64decode(encoding)))
+
+    alpha_channel = None
+    try:
+        image = ImageOps.exif_transpose(image)
+    except:
+        pass
+    # exif_transpose will remove exif rotate info，we must call image.info after exif_transpose
+    infos = image.info
+
+    if gray:
+        image = image.convert("L")
+        np_img = np.array(image)
+    else:
+        if image.mode == "RGBA":
+            np_img = np.array(image)
+            alpha_channel = np_img[:, :, -1]
+            np_img = cv2.cvtColor(np_img, cv2.COLOR_RGBA2RGB)
+        else:
+            image = image.convert("RGB")
+            np_img = np.array(image)
+
+    return np_img, alpha_channel, infos
+
+
+def encode_pil_to_base64(image: Image, quality: int, infos: Dict) -> bytes:
+    img_bytes = pil_to_bytes(
+        image,
+        "png",
+        quality=quality,
+        infos=infos,
+    )
+    return base64.b64encode(img_bytes)
+
+
+def concat_alpha_channel(rgb_np_img, alpha_channel) -> np.ndarray:
+    if alpha_channel is not None:
+        if alpha_channel.shape[:2] != rgb_np_img.shape[:2]:
+            alpha_channel = cv2.resize(
+                alpha_channel, dsize=(rgb_np_img.shape[1], rgb_np_img.shape[0])
+            )
+        rgb_np_img = np.concatenate(
+            (rgb_np_img, alpha_channel[:, :, np.newaxis]), axis=-1
+        )
+    return rgb_np_img
+
+
+def adjust_mask(mask: np.ndarray, kernel_size: int, operate):
+    # fronted brush color "ffcc00bb"
+    # kernel_size = kernel_size*2+1
+    mask[mask >= 127] = 255
+    mask[mask < 127] = 0
+
+    if operate == "reverse":
+        mask = 255 - mask
+    else:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * kernel_size + 1, 2 * kernel_size + 1)
+        )
+        if operate == "expand":
+            mask = cv2.dilate(
+                mask,
+                kernel,
+                iterations=1,
+            )
+        else:
+            mask = cv2.erode(
+                mask,
+                kernel,
+                iterations=1,
+            )
+    res_mask = np.zeros((mask.shape[0], mask.shape[1], 4), dtype=np.uint8)
+    res_mask[mask > 128] = [255, 203, 0, int(255 * 0.73)]
+    res_mask = cv2.cvtColor(res_mask, cv2.COLOR_BGRA2RGBA)
+    return res_mask
+
+
+def gen_frontend_mask(bgr_or_gray_mask):
+    if len(bgr_or_gray_mask.shape) == 3 and bgr_or_gray_mask.shape[2] != 1:
+        bgr_or_gray_mask = cv2.cvtColor(bgr_or_gray_mask, cv2.COLOR_BGR2GRAY)
+
+    # fronted brush color "ffcc00bb"
+    # TODO: how to set kernel size?
+    kernel_size = 9
+    bgr_or_gray_mask = cv2.dilate(
+        bgr_or_gray_mask,
+        np.ones((kernel_size, kernel_size), np.uint8),
+        iterations=1,
+    )
+    res_mask = np.zeros(
+        (bgr_or_gray_mask.shape[0], bgr_or_gray_mask.shape[1], 4), dtype=np.uint8
+    )
+    res_mask[bgr_or_gray_mask > 128] = [255, 203, 0, int(255 * 0.73)]
+    res_mask = cv2.cvtColor(res_mask, cv2.COLOR_BGRA2RGBA)
+    return res_mask
