@@ -6,20 +6,21 @@ import torch
 import numpy as np
 import torch.fft as fft
 
-from lama_cleaner.schema import Config
+from iopaint.schema import InpaintRequest
 
-from lama_cleaner.helper import (
+from iopaint.helper import (
     load_model,
     get_cache_path_by_url,
     norm_img,
     boxes_from_mask,
     resize_max_size,
+    download_model,
 )
-from lama_cleaner.model.base import InpaintModel
+from .base import InpaintModel
 from torch import conv2d, nn
 import torch.nn.functional as F
 
-from lama_cleaner.model.utils import (
+from .utils import (
     setup_filter,
     _parse_scaling,
     _parse_padding,
@@ -870,7 +871,6 @@ class SpectralTransform(nn.Module):
         )
 
     def forward(self, x):
-
         x = self.downsample(x)
         x = self.conv1(x)
         output = self.fu(x)
@@ -1437,7 +1437,6 @@ class SynthesisNetwork(torch.nn.Module):
             setattr(self, f"b{res}", block)
 
     def forward(self, x_global, mask, feats, ws, fname=None, **block_kwargs):
-
         img = None
 
         x, img = self.foreword(x_global, ws, feats, img)
@@ -1627,6 +1626,7 @@ class FcF(InpaintModel):
     min_size = 512
     pad_mod = 512
     pad_to_square = True
+    is_erase_model = True
 
     def init_model(self, device, **kwargs):
         seed = 0
@@ -1657,11 +1657,15 @@ class FcF(InpaintModel):
         self.label = torch.zeros([1, self.model.c_dim], device=device)
 
     @staticmethod
+    def download():
+        download_model(FCF_MODEL_URL, FCF_MODEL_MD5)
+
+    @staticmethod
     def is_downloaded() -> bool:
         return os.path.exists(get_cache_path_by_url(FCF_MODEL_URL))
 
     @torch.no_grad()
-    def __call__(self, image, mask, config: Config):
+    def __call__(self, image, mask, config: InpaintRequest):
         """
         images: [H, W, C] RGB, not normalized
         masks: [H, W]
@@ -1694,14 +1698,14 @@ class FcF(InpaintModel):
 
             crop_result.append((inpaint_result, crop_box))
 
-        inpaint_result = image[:, :, ::-1]
+        inpaint_result = image[:, :, ::-1].copy()
         for crop_image, crop_box in crop_result:
             x1, y1, x2, y2 = crop_box
             inpaint_result[y1:y2, x1:x2, :] = crop_image
 
         return inpaint_result
 
-    def forward(self, image, mask, config: Config):
+    def forward(self, image, mask, config: InpaintRequest):
         """Input images and output images have same size
         images: [H, W, C] RGB
         masks: [H, W] mask area == 255

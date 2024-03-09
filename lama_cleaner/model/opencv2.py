@@ -1,6 +1,6 @@
 import cv2
-from lama_cleaner.model.base import InpaintModel
-from lama_cleaner.schema import Config
+from .base import InpaintModel
+from iopaint.schema import InpaintRequest
 
 flag_map = {"INPAINT_NS": cv2.INPAINT_NS, "INPAINT_TELEA": cv2.INPAINT_TELEA}
 
@@ -8,12 +8,13 @@ flag_map = {"INPAINT_NS": cv2.INPAINT_NS, "INPAINT_TELEA": cv2.INPAINT_TELEA}
 class OpenCV2(InpaintModel):
     name = "cv2"
     pad_mod = 1
+    is_erase_model = True
 
     @staticmethod
     def is_downloaded() -> bool:
         return True
 
-    def forward(self, image, mask, config: Config):
+    def forward(self, image, mask, config: InpaintRequest):
         """Input image and output image have same size
         image: [H, W, C] RGB
         mask: [H, W, 1]

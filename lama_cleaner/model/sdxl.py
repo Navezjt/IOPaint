@@ -1,7 +1,12 @@
+import os
+
 import PIL.Image
 import cv2
 import torch
+from diffusers import AutoencoderKL
 from loguru import logger
+
+from iopaint.schema import InpaintRequest, ModelType
 
 from .base import DiffusionInpaintModel
 from .helper.cpu_text_encoder import CPUTextEncoderWrapper
@@ -12,56 +17,49 @@ from .utils import (
     enable_low_mem,
     is_local_files_only,
 )
-from iopaint.schema import InpaintRequest, ModelType
 
 
-class SD(DiffusionInpaintModel):
+class SDXL(DiffusionInpaintModel):
+    name = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
     pad_mod = 8
     min_size = 512
-    lcm_lora_id = "latent-consistency/lcm-lora-sdv1-5"
+    lcm_lora_id = "latent-consistency/lcm-lora-sdxl"
+    model_id_or_path = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
 
     def init_model(self, device: torch.device, **kwargs):
-        from diffusers.pipelines.stable_diffusion import StableDiffusionInpaintPipeline
+        from diffusers.pipelines import StableDiffusionXLInpaintPipeline
 
         use_gpu, torch_dtype = get_torch_dtype(device, kwargs.get("no_half", False))
 
-        model_kwargs = {
-            **kwargs.get("pipe_components", {}),
-            "local_files_only": is_local_files_only(**kwargs),
-        }
-        disable_nsfw_checker = kwargs["disable_nsfw"] or kwargs.get(
-            "cpu_offload", False
-        )
-        if disable_nsfw_checker:
-            logger.info("Disable Stable Diffusion Model NSFW checker")
-            model_kwargs.update(
-                dict(
-                    safety_checker=None,
-                    feature_extractor=None,
-                    requires_safety_checker=False,
-                )
-            )
+        if self.model_info.model_type == ModelType.DIFFUSERS_SDXL:
+            num_in_channels = 4
+        else:
+            num_in_channels = 9
 
-        if self.model_info.is_single_file_diffusers:
-            if self.model_info.model_type == ModelType.DIFFUSERS_SD:
-                model_kwargs["num_in_channels"] = 4
-            else:
-                model_kwargs["num_in_channels"] = 9
-
-            self.model = StableDiffusionInpaintPipeline.from_single_file(
+        if os.path.isfile(self.model_id_or_path):
+            self.model = StableDiffusionXLInpaintPipeline.from_single_file(
                 self.model_id_or_path,
                 torch_dtype=torch_dtype,
-                load_safety_checker=not disable_nsfw_checker,
-                config_files=get_config_files(),
-                **model_kwargs,
+                num_in_channels=num_in_channels,
+                load_safety_checker=False,
+                config_files=get_config_files()
             )
         else:
+            model_kwargs = {
+                **kwargs.get("pipe_components", {}),
+                "local_files_only": is_local_files_only(**kwargs),
+            }
+            if "vae" not in model_kwargs:
+                vae = AutoencoderKL.from_pretrained(
+                    "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch_dtype
+                )
+                model_kwargs["vae"] = vae
             self.model = handle_from_pretrained_exceptions(
-                StableDiffusionInpaintPipeline.from_pretrained,
+                StableDiffusionXLInpaintPipeline.from_pretrained,
                 pretrained_model_name_or_path=self.model_id_or_path,
-                variant="fp16",
                 torch_dtype=torch_dtype,
-                **model_kwargs,
+                variant="fp16",
+                **model_kwargs
             )
 
         enable_low_mem(self.model, kwargs.get("low_mem", False))
@@ -75,6 +73,9 @@ class SD(DiffusionInpaintModel):
                 logger.info("Run Stable Diffusion TextEncoder on CPU")
                 self.model.text_encoder = CPUTextEncoderWrapper(
                     self.model.text_encoder, torch_dtype
+                )
+                self.model.text_encoder_2 = CPUTextEncoderWrapper(
+                    self.model.text_encoder_2, torch_dtype
                 )
 
         self.callback = kwargs.pop("callback", None)
@@ -95,7 +96,7 @@ class SD(DiffusionInpaintModel):
             negative_prompt=config.negative_prompt,
             mask_image=PIL.Image.fromarray(mask[:, :, -1], mode="L"),
             num_inference_steps=config.sd_steps,
-            strength=config.sd_strength,
+            strength=0.999 if config.sd_strength == 1.0 else config.sd_strength,
             guidance_scale=config.sd_guidance_scale,
             output_type="np",
             callback_on_step_end=self.callback,
@@ -107,23 +108,3 @@ class SD(DiffusionInpaintModel):
         output = (output * 255).round().astype("uint8")
         output = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
         return output
-
-
-class SD15(SD):
-    name = "runwayml/stable-diffusion-inpainting"
-    model_id_or_path = "runwayml/stable-diffusion-inpainting"
-
-
-class Anything4(SD):
-    name = "Sanster/anything-4.0-inpainting"
-    model_id_or_path = "Sanster/anything-4.0-inpainting"
-
-
-class RealisticVision14(SD):
-    name = "Sanster/Realistic_Vision_V1.4-inpainting"
-    model_id_or_path = "Sanster/Realistic_Vision_V1.4-inpainting"
-
-
-class SD2(SD):
-    name = "stabilityai/stable-diffusion-2-inpainting"
-    model_id_or_path = "stabilityai/stable-diffusion-2-inpainting"

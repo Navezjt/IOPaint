@@ -4,20 +4,20 @@ import numpy as np
 import torch
 from loguru import logger
 
-from lama_cleaner.model.base import InpaintModel
-from lama_cleaner.model.ddim_sampler import DDIMSampler
-from lama_cleaner.model.plms_sampler import PLMSSampler
-from lama_cleaner.schema import Config, LDMSampler
+from .base import InpaintModel
+from .ddim_sampler import DDIMSampler
+from .plms_sampler import PLMSSampler
+from iopaint.schema import InpaintRequest, LDMSampler
 
 torch.manual_seed(42)
 import torch.nn as nn
-from lama_cleaner.helper import (
+from iopaint.helper import (
     download_model,
     norm_img,
     get_cache_path_by_url,
     load_jit_model,
 )
-from lama_cleaner.model.utils import (
+from .utils import (
     make_beta_schedule,
     timestep_embedding,
 )
@@ -237,6 +237,7 @@ class LatentDiffusion(DDPM):
 class LDM(InpaintModel):
     name = "ldm"
     pad_mod = 32
+    is_erase_model = True
 
     def __init__(self, device, fp16: bool = True, **kwargs):
         self.fp16 = fp16
@@ -261,6 +262,12 @@ class LDM(InpaintModel):
         self.model = LatentDiffusion(self.diffusion_model, device)
 
     @staticmethod
+    def download():
+        download_model(LDM_DIFFUSION_MODEL_URL, LDM_DIFFUSION_MODEL_MD5)
+        download_model(LDM_DECODE_MODEL_URL, LDM_DECODE_MODEL_MD5)
+        download_model(LDM_ENCODE_MODEL_URL, LDM_ENCODE_MODEL_MD5)
+
+    @staticmethod
     def is_downloaded() -> bool:
         model_paths = [
             get_cache_path_by_url(LDM_DIFFUSION_MODEL_URL),
@@ -270,7 +277,7 @@ class LDM(InpaintModel):
         return all([os.path.exists(it) for it in model_paths])
 
     @torch.cuda.amp.autocast()
-    def forward(self, image, mask, config: Config):
+    def forward(self, image, mask, config: InpaintRequest):
         """
         image: [H, W, C] RGB
         mask: [H, W, 1]

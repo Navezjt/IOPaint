@@ -1,5 +1,7 @@
+import gc
 import math
 import random
+import traceback
 from typing import Any
 
 import torch
@@ -15,9 +17,15 @@ from diffusers import (
     EulerAncestralDiscreteScheduler,
     DPMSolverMultistepScheduler,
     UniPCMultistepScheduler,
+    LCMScheduler,
+    DPMSolverSinglestepScheduler,
+    KDPM2DiscreteScheduler,
+    KDPM2AncestralDiscreteScheduler,
+    HeunDiscreteScheduler,
 )
+from loguru import logger
 
-from lama_cleaner.schema import SDSampler
+from iopaint.schema import SDSampler
 from torch import conv2d, conv_transpose2d
 
 
@@ -27,7 +35,7 @@ def make_beta_schedule(
     if schedule == "linear":
         betas = (
             torch.linspace(
-                linear_start ** 0.5, linear_end ** 0.5, n_timestep, dtype=torch.float64
+                linear_start**0.5, linear_end**0.5, n_timestep, dtype=torch.float64
             )
             ** 2
         )
@@ -772,7 +780,7 @@ def conv2d_resample(
             f=f,
             up=up,
             padding=[px0, px1, py0, py1],
-            gain=up ** 2,
+            gain=up**2,
             flip_filter=flip_filter,
         )
         return x
@@ -814,7 +822,7 @@ def conv2d_resample(
             x=x,
             f=f,
             padding=[px0 + pxt, px1 + pxt, py0 + pyt, py1 + pyt],
-            gain=up ** 2,
+            gain=up**2,
             flip_filter=flip_filter,
         )
         if down > 1:
@@ -834,7 +842,7 @@ def conv2d_resample(
         f=(f if up > 1 else None),
         up=up,
         padding=[px0, px1, py0, py1],
-        gain=up ** 2,
+        gain=up**2,
         flip_filter=flip_filter,
     )
     x = _conv2d_wrapper(x=x, w=w, groups=groups, flip_weight=flip_weight)
@@ -870,7 +878,7 @@ class Conv2dLayer(torch.nn.Module):
         self.register_buffer("resample_filter", setup_filter(resample_filter))
         self.conv_clamp = conv_clamp
         self.padding = kernel_size // 2
-        self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
+        self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size**2))
         self.act_gain = activation_funcs[activation].def_gain
 
         memory_format = (
@@ -913,6 +921,7 @@ def torch_gc():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+    gc.collect()
 
 
 def set_seed(seed: int):
@@ -923,19 +932,102 @@ def set_seed(seed: int):
 
 
 def get_scheduler(sd_sampler, scheduler_config):
-    if sd_sampler == SDSampler.ddim:
-        return DDIMScheduler.from_config(scheduler_config)
-    elif sd_sampler == SDSampler.pndm:
-        return PNDMScheduler.from_config(scheduler_config)
-    elif sd_sampler == SDSampler.k_lms:
-        return LMSDiscreteScheduler.from_config(scheduler_config)
-    elif sd_sampler == SDSampler.k_euler:
-        return EulerDiscreteScheduler.from_config(scheduler_config)
-    elif sd_sampler == SDSampler.k_euler_a:
-        return EulerAncestralDiscreteScheduler.from_config(scheduler_config)
-    elif sd_sampler == SDSampler.dpm_plus_plus:
-        return DPMSolverMultistepScheduler.from_config(scheduler_config)
-    elif sd_sampler == SDSampler.uni_pc:
-        return UniPCMultistepScheduler.from_config(scheduler_config)
+    # https://github.com/huggingface/diffusers/issues/4167
+    keys_to_pop = ["use_karras_sigmas", "algorithm_type"]
+    scheduler_config = dict(scheduler_config)
+    for it in keys_to_pop:
+        scheduler_config.pop(it, None)
+
+    # fmt: off
+    samplers = {
+        SDSampler.dpm_plus_plus_2m: [DPMSolverMultistepScheduler],
+        SDSampler.dpm_plus_plus_2m_karras: [DPMSolverMultistepScheduler, dict(use_karras_sigmas=True)],
+        SDSampler.dpm_plus_plus_2m_sde: [DPMSolverMultistepScheduler, dict(algorithm_type="sde-dpmsolver++")],
+        SDSampler.dpm_plus_plus_2m_sde_karras: [DPMSolverMultistepScheduler, dict(algorithm_type="sde-dpmsolver++", use_karras_sigmas=True)],
+        SDSampler.dpm_plus_plus_sde: [DPMSolverSinglestepScheduler],
+        SDSampler.dpm_plus_plus_sde_karras: [DPMSolverSinglestepScheduler, dict(use_karras_sigmas=True)],
+        SDSampler.dpm2: [KDPM2DiscreteScheduler],
+        SDSampler.dpm2_karras: [KDPM2DiscreteScheduler, dict(use_karras_sigmas=True)],
+        SDSampler.dpm2_a: [KDPM2AncestralDiscreteScheduler],
+        SDSampler.dpm2_a_karras: [KDPM2AncestralDiscreteScheduler, dict(use_karras_sigmas=True)],
+        SDSampler.euler: [EulerDiscreteScheduler],
+        SDSampler.euler_a: [EulerAncestralDiscreteScheduler],
+        SDSampler.heun: [HeunDiscreteScheduler],
+        SDSampler.lms: [LMSDiscreteScheduler],
+        SDSampler.lms_karras: [LMSDiscreteScheduler, dict(use_karras_sigmas=True)],
+        SDSampler.ddim: [DDIMScheduler],
+        SDSampler.pndm: [PNDMScheduler],
+        SDSampler.uni_pc: [UniPCMultistepScheduler],
+        SDSampler.lcm: [LCMScheduler],
+    }
+    # fmt: on
+    if sd_sampler in samplers:
+        if len(samplers[sd_sampler]) == 2:
+            scheduler_cls, kwargs = samplers[sd_sampler]
+        else:
+            scheduler_cls, kwargs = samplers[sd_sampler][0], {}
+        return scheduler_cls.from_config(scheduler_config, **kwargs)
     else:
         raise ValueError(sd_sampler)
+
+
+def is_local_files_only(**kwargs) -> bool:
+    from huggingface_hub.constants import HF_HUB_OFFLINE
+
+    return HF_HUB_OFFLINE or kwargs.get("local_files_only", False)
+
+
+def handle_from_pretrained_exceptions(func, **kwargs):
+    try:
+        return func(**kwargs)
+    except ValueError as e:
+        if "You are trying to load the model files of the `variant=fp16`" in str(e):
+            logger.info("variant=fp16 not found, try revision=fp16")
+            try:
+                return func(**{**kwargs, "variant": None, "revision": "fp16"})
+            except Exception as e:
+                logger.info("revision=fp16 not found, try revision=main")
+                return func(**{**kwargs, "variant": None, "revision": "main"})
+        raise e
+    except OSError as e:
+        previous_traceback = traceback.format_exc()
+        if "RevisionNotFoundError: 404 Client Error." in previous_traceback:
+            logger.info("revision=fp16 not found, try revision=main")
+            return func(**{**kwargs, "variant": None, "revision": "main"})
+        elif "Max retries exceeded" in previous_traceback:
+            logger.exception(
+                "Fetching model from HuggingFace failed. "
+                "If this is your first time downloading the model, you may need to set up proxy in terminal."
+                "If the model has already been downloaded, you can add --local-files-only when starting."
+            )
+            exit(-1)
+        raise e
+    except Exception as e:
+        raise e
+
+
+def get_torch_dtype(device, no_half: bool):
+    device = str(device)
+    use_fp16 = not no_half
+    use_gpu = device == "cuda"
+    # https://github.com/huggingface/diffusers/issues/4480
+    # pipe.enable_attention_slicing and float16 will cause black output on mps
+    # if device in ["cuda", "mps"] and use_fp16:
+    if device in ["cuda"] and use_fp16:
+        return use_gpu, torch.float16
+    return use_gpu, torch.float32
+
+
+def enable_low_mem(pipe, enable: bool):
+    if torch.backends.mps.is_available():
+        # https://huggingface.co/docs/diffusers/v0.25.0/en/api/pipelines/stable_diffusion/image_variation#diffusers.StableDiffusionImageVariationPipeline.enable_attention_slicing
+        # CUDA: Don't enable attention slicing if you're already using `scaled_dot_product_attention` (SDPA) from PyTorch 2.0 or xFormers.
+        if enable:
+            pipe.enable_attention_slicing("max")
+        else:
+            # https://huggingface.co/docs/diffusers/optimization/mps
+            # Devices with less than 64GB of memory are recommended to use enable_attention_slicing
+            pipe.enable_attention_slicing()
+
+    if enable:
+        pipe.vae.enable_tiling()

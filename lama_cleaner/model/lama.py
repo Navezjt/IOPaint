@@ -4,13 +4,14 @@ import cv2
 import numpy as np
 import torch
 
-from lama_cleaner.helper import (
+from iopaint.helper import (
     norm_img,
     get_cache_path_by_url,
     load_jit_model,
+    download_model,
 )
-from lama_cleaner.model.base import InpaintModel
-from lama_cleaner.schema import Config
+from iopaint.schema import InpaintRequest
+from .base import InpaintModel
 
 LAMA_MODEL_URL = os.environ.get(
     "LAMA_MODEL_URL",
@@ -22,6 +23,11 @@ LAMA_MODEL_MD5 = os.environ.get("LAMA_MODEL_MD5", "e3aa4aaa15225a33ec84f9f4bc47e
 class LaMa(InpaintModel):
     name = "lama"
     pad_mod = 8
+    is_erase_model = True
+
+    @staticmethod
+    def download():
+        download_model(LAMA_MODEL_URL, LAMA_MODEL_MD5)
 
     def init_model(self, device, **kwargs):
         self.model = load_jit_model(LAMA_MODEL_URL, device, LAMA_MODEL_MD5).eval()
@@ -30,7 +36,7 @@ class LaMa(InpaintModel):
     def is_downloaded() -> bool:
         return os.path.exists(get_cache_path_by_url(LAMA_MODEL_URL))
 
-    def forward(self, image, mask, config: Config):
+    def forward(self, image, mask, config: InpaintRequest):
         """Input image and output image have same size
         image: [H, W, C] RGB
         mask: [H, W]
