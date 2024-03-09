@@ -1,201 +1,222 @@
 import os
 
+from loguru import logger
+
+from iopaint.tests.utils import check_device, get_config, assert_equal
+
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 from pathlib import Path
 
 import pytest
 import torch
 
-from lama_cleaner.model_manager import ModelManager
-from lama_cleaner.schema import HDStrategy, SDSampler
-from lama_cleaner.tests.test_model import get_config, assert_equal
+from iopaint.model_manager import ModelManager
+from iopaint.schema import HDStrategy, SDSampler, FREEUConfig
 
 current_dir = Path(__file__).parent.absolute().resolve()
 save_dir = current_dir / "result"
 save_dir.mkdir(exist_ok=True, parents=True)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-device = torch.device(device)
 
 
-@pytest.mark.parametrize("sd_device", ["cuda"])
-@pytest.mark.parametrize("strategy", [HDStrategy.ORIGINAL])
-@pytest.mark.parametrize("sampler", [SDSampler.ddim])
-@pytest.mark.parametrize("cpu_textencoder", [True, False])
-@pytest.mark.parametrize("disable_nsfw", [True, False])
-def test_runway_sd_1_5_ddim(
-    sd_device, strategy, sampler, cpu_textencoder, disable_nsfw
-):
-    def callback(i, t, latents):
-        pass
-
-    if sd_device == "cuda" and not torch.cuda.is_available():
-        return
-
-    sd_steps = 50 if sd_device == "cuda" else 1
+@pytest.mark.parametrize("device", ["cuda", "mps"])
+def test_runway_sd_1_5_all_samplers(device):
+    sd_steps = check_device(device)
     model = ModelManager(
-        name="sd1.5",
-        device=torch.device(sd_device),
-        hf_access_token="",
-        sd_run_local=True,
-        disable_nsfw=disable_nsfw,
-        sd_cpu_textencoder=cpu_textencoder,
-        callback=callback,
-    )
-    cfg = get_config(strategy, prompt="a fox sitting on a bench", sd_steps=sd_steps)
-    cfg.sd_sampler = sampler
-
-    name = f"device_{sd_device}_{sampler}_cpu_textencoder_{cpu_textencoder}_disnsfw_{disable_nsfw}"
-
-    assert_equal(
-        model,
-        cfg,
-        f"runway_sd_{strategy.capitalize()}_{name}.png",
-        img_p=current_dir / "overture-creations-5sI6fQgYIuo.png",
-        mask_p=current_dir / "overture-creations-5sI6fQgYIuo_mask.png",
-        fx=1.3,
-    )
-
-
-@pytest.mark.parametrize("sd_device", ["cuda"])
-@pytest.mark.parametrize("strategy", [HDStrategy.ORIGINAL])
-@pytest.mark.parametrize(
-    "sampler", [SDSampler.pndm, SDSampler.k_lms, SDSampler.k_euler, SDSampler.k_euler_a]
-)
-@pytest.mark.parametrize("cpu_textencoder", [False])
-@pytest.mark.parametrize("disable_nsfw", [True])
-def test_runway_sd_1_5(sd_device, strategy, sampler, cpu_textencoder, disable_nsfw):
-    def callback(i, t, latents):
-        print(f"sd_step_{i}")
-
-    if sd_device == "cuda" and not torch.cuda.is_available():
-        return
-
-    sd_steps = 50 if sd_device == "cuda" else 1
-    model = ModelManager(
-        name="sd1.5",
-        device=torch.device(sd_device),
-        hf_access_token="",
-        sd_run_local=True,
-        disable_nsfw=disable_nsfw,
-        sd_cpu_textencoder=cpu_textencoder,
-        callback=callback,
-    )
-    cfg = get_config(strategy, prompt="a fox sitting on a bench", sd_steps=sd_steps)
-    cfg.sd_sampler = sampler
-
-    name = f"device_{sd_device}_{sampler}_cpu_textencoder_{cpu_textencoder}_disnsfw_{disable_nsfw}"
-
-    assert_equal(
-        model,
-        cfg,
-        f"runway_sd_{strategy.capitalize()}_{name}.png",
-        img_p=current_dir / "overture-creations-5sI6fQgYIuo.png",
-        mask_p=current_dir / "overture-creations-5sI6fQgYIuo_mask.png",
-        fx=1.3,
-    )
-
-
-@pytest.mark.parametrize("sd_device", ["cuda"])
-@pytest.mark.parametrize("strategy", [HDStrategy.ORIGINAL])
-@pytest.mark.parametrize("sampler", [SDSampler.ddim])
-def test_runway_sd_1_5_negative_prompt(sd_device, strategy, sampler):
-    def callback(i, t, latents):
-        pass
-
-    if sd_device == "cuda" and not torch.cuda.is_available():
-        return
-
-    sd_steps = 50 if sd_device == "cuda" else 1
-    model = ModelManager(
-        name="sd1.5",
-        device=torch.device(sd_device),
-        hf_access_token="",
-        sd_run_local=True,
-        disable_nsfw=False,
+        name="runwayml/stable-diffusion-inpainting",
+        device=torch.device(device),
+        disable_nsfw=True,
         sd_cpu_textencoder=False,
-        callback=callback,
-    )
-    cfg = get_config(
-        strategy,
-        sd_steps=sd_steps,
-        prompt="Face of a fox, high resolution, sitting on a park bench",
-        negative_prompt="orange, yellow, small",
-        sd_sampler=sampler,
-        sd_match_histograms=True,
     )
 
-    name = f"{sampler}_negative_prompt"
+    all_samplers = [member.value for member in SDSampler.__members__.values()]
+    print(all_samplers)
+    for sampler in all_samplers:
+        print(f"Testing sampler {sampler}")
+        if (
+            sampler
+            in [SDSampler.dpm2_karras, SDSampler.dpm2_a_karras, SDSampler.lms_karras]
+            and device == "mps"
+        ):
+            # diffusers 0.25.0 still has bug on these sampler on mps, wait main branch released to fix it
+            logger.warning(
+                "skip dpm2_karras on mps, diffusers does not support it on mps. TypeError: Cannot convert a MPS Tensor to float64 dtype as the MPS framework doesn't support float64. Please use float32 instead."
+            )
+            continue
+        cfg = get_config(
+            strategy=HDStrategy.ORIGINAL,
+            prompt="a fox sitting on a bench",
+            sd_steps=sd_steps,
+            sd_sampler=sampler,
+        )
 
-    assert_equal(
-        model,
-        cfg,
-        f"runway_sd_{strategy.capitalize()}_{name}.png",
-        img_p=current_dir / "overture-creations-5sI6fQgYIuo.png",
-        mask_p=current_dir / "overture-creations-5sI6fQgYIuo_mask.png",
-        fx=1,
-    )
+        name = f"device_{device}_{sampler}"
+
+        assert_equal(
+            model,
+            cfg,
+            f"runway_sd_{name}.png",
+            img_p=current_dir / "overture-creations-5sI6fQgYIuo.png",
+            mask_p=current_dir / "overture-creations-5sI6fQgYIuo_mask.png",
+        )
 
 
-@pytest.mark.parametrize("sd_device", ["cuda"])
-@pytest.mark.parametrize("strategy", [HDStrategy.ORIGINAL])
-@pytest.mark.parametrize("sampler", [SDSampler.k_euler_a])
-@pytest.mark.parametrize("cpu_textencoder", [False])
-@pytest.mark.parametrize("disable_nsfw", [False])
-def test_runway_sd_1_5_sd_scale(
-    sd_device, strategy, sampler, cpu_textencoder, disable_nsfw
-):
-    if sd_device == "cuda" and not torch.cuda.is_available():
-        return
+@pytest.mark.parametrize("device", ["cuda", "mps", "cpu"])
+@pytest.mark.parametrize("sampler", [SDSampler.lcm])
+def test_runway_sd_lcm_lora(device, sampler):
+    check_device(device)
 
-    sd_steps = 50 if sd_device == "cuda" else 1
+    sd_steps = 5
     model = ModelManager(
-        name="sd1.5",
-        device=torch.device(sd_device),
-        hf_access_token="",
-        sd_run_local=True,
-        disable_nsfw=disable_nsfw,
-        sd_cpu_textencoder=cpu_textencoder,
+        name="runwayml/stable-diffusion-inpainting",
+        device=torch.device(device),
+        disable_nsfw=True,
+        sd_cpu_textencoder=False,
     )
     cfg = get_config(
-        strategy, prompt="a fox sitting on a bench", sd_steps=sd_steps, sd_scale=0.85
+        strategy=HDStrategy.ORIGINAL,
+        prompt="face of a fox, sitting on a bench",
+        sd_steps=sd_steps,
+        sd_guidance_scale=2,
+        sd_lcm_lora=True,
     )
     cfg.sd_sampler = sampler
 
-    name = f"device_{sd_device}_{sampler}_cpu_textencoder_{cpu_textencoder}_disnsfw_{disable_nsfw}"
+    assert_equal(
+        model,
+        cfg,
+        f"runway_sd_1_5_lcm_lora_device_{device}.png",
+        img_p=current_dir / "overture-creations-5sI6fQgYIuo.png",
+        mask_p=current_dir / "overture-creations-5sI6fQgYIuo_mask.png",
+    )
+
+
+@pytest.mark.parametrize("device", ["cuda", "mps", "cpu"])
+@pytest.mark.parametrize("sampler", [SDSampler.ddim])
+def test_runway_sd_freeu(device, sampler):
+    sd_steps = check_device(device)
+    model = ModelManager(
+        name="runwayml/stable-diffusion-inpainting",
+        device=torch.device(device),
+        disable_nsfw=True,
+        sd_cpu_textencoder=False,
+    )
+    cfg = get_config(
+        strategy=HDStrategy.ORIGINAL,
+        prompt="face of a fox, sitting on a bench",
+        sd_steps=sd_steps,
+        sd_guidance_scale=7.5,
+        sd_freeu=True,
+        sd_freeu_config=FREEUConfig(),
+    )
+    cfg.sd_sampler = sampler
 
     assert_equal(
         model,
         cfg,
-        f"runway_sd_{strategy.capitalize()}_{name}_sdscale.png",
+        f"runway_sd_1_5_freeu_device_{device}.png",
         img_p=current_dir / "overture-creations-5sI6fQgYIuo.png",
         mask_p=current_dir / "overture-creations-5sI6fQgYIuo_mask.png",
-        fx=1.3,
     )
 
 
-@pytest.mark.parametrize("sd_device", ["cuda"])
+@pytest.mark.parametrize("device", ["cuda", "mps"])
 @pytest.mark.parametrize("strategy", [HDStrategy.ORIGINAL])
-@pytest.mark.parametrize("sampler", [SDSampler.k_euler_a])
-def test_runway_sd_1_5_cpu_offload(sd_device, strategy, sampler):
-    if sd_device == "cuda" and not torch.cuda.is_available():
-        return
-
-    sd_steps = 50 if sd_device == "cuda" else 1
+@pytest.mark.parametrize("sampler", [SDSampler.ddim])
+def test_runway_sd_sd_strength(device, strategy, sampler):
+    sd_steps = check_device(device)
     model = ModelManager(
-        name="sd1.5",
-        device=torch.device(sd_device),
-        hf_access_token="",
-        sd_run_local=True,
+        name="runwayml/stable-diffusion-inpainting",
+        device=torch.device(device),
+        disable_nsfw=True,
+        sd_cpu_textencoder=False,
+    )
+    cfg = get_config(
+        strategy=strategy,
+        prompt="a fox sitting on a bench",
+        sd_steps=sd_steps,
+        sd_strength=0.8,
+    )
+    cfg.sd_sampler = sampler
+
+    assert_equal(
+        model,
+        cfg,
+        f"runway_sd_strength_0.8_device_{device}.png",
+        img_p=current_dir / "overture-creations-5sI6fQgYIuo.png",
+        mask_p=current_dir / "overture-creations-5sI6fQgYIuo_mask.png",
+    )
+
+
+@pytest.mark.parametrize("device", ["cuda", "cpu"])
+@pytest.mark.parametrize("strategy", [HDStrategy.ORIGINAL])
+@pytest.mark.parametrize("sampler", [SDSampler.ddim])
+def test_runway_sd_cpu_textencoder(device, strategy, sampler):
+    sd_steps = check_device(device)
+    model = ModelManager(
+        name="runwayml/stable-diffusion-inpainting",
+        device=torch.device(device),
+        disable_nsfw=True,
+        sd_cpu_textencoder=True,
+    )
+    cfg = get_config(
+        strategy=strategy,
+        prompt="a fox sitting on a bench",
+        sd_steps=sd_steps,
+        sd_sampler=sampler,
+    )
+
+    assert_equal(
+        model,
+        cfg,
+        f"runway_sd_device_{device}_cpu_textencoder.png",
+        img_p=current_dir / "overture-creations-5sI6fQgYIuo.png",
+        mask_p=current_dir / "overture-creations-5sI6fQgYIuo_mask.png",
+    )
+
+
+@pytest.mark.parametrize("device", ["cuda", "mps", "cpu"])
+@pytest.mark.parametrize("strategy", [HDStrategy.ORIGINAL])
+@pytest.mark.parametrize("sampler", [SDSampler.ddim])
+def test_runway_norm_sd_model(device, strategy, sampler):
+    sd_steps = check_device(device)
+    model = ModelManager(
+        name="runwayml/stable-diffusion-v1-5",
+        device=torch.device(device),
+        disable_nsfw=True,
+        sd_cpu_textencoder=False,
+    )
+    cfg = get_config(
+        strategy=strategy, prompt="face of a fox, sitting on a bench", sd_steps=sd_steps
+    )
+    cfg.sd_sampler = sampler
+
+    assert_equal(
+        model,
+        cfg,
+        f"runway_{device}_norm_sd_model_device_{device}.png",
+        img_p=current_dir / "overture-creations-5sI6fQgYIuo.png",
+        mask_p=current_dir / "overture-creations-5sI6fQgYIuo_mask.png",
+    )
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+@pytest.mark.parametrize("strategy", [HDStrategy.ORIGINAL])
+@pytest.mark.parametrize("sampler", [SDSampler.dpm_plus_plus_2m])
+def test_runway_sd_1_5_cpu_offload(device, strategy, sampler):
+    sd_steps = check_device(device)
+    model = ModelManager(
+        name="runwayml/stable-diffusion-inpainting",
+        device=torch.device(device),
         disable_nsfw=True,
         sd_cpu_textencoder=False,
         cpu_offload=True,
     )
     cfg = get_config(
-        strategy, prompt="a fox sitting on a bench", sd_steps=sd_steps, sd_scale=0.85
+        strategy=strategy, prompt="a fox sitting on a bench", sd_steps=sd_steps
     )
     cfg.sd_sampler = sampler
 
-    name = f"device_{sd_device}_{sampler}"
+    name = f"device_{device}_{sampler}"
 
     assert_equal(
         model,
@@ -206,31 +227,36 @@ def test_runway_sd_1_5_cpu_offload(sd_device, strategy, sampler):
     )
 
 
-@pytest.mark.parametrize("sd_device", ["cuda", "mps"])
-@pytest.mark.parametrize("sampler", [SDSampler.uni_pc])
-def test_local_file_path(sd_device, sampler):
-    if sd_device == "cuda" and not torch.cuda.is_available():
-        return
-
-    sd_steps = 1 if sd_device == "cpu" else 50
+@pytest.mark.parametrize("device", ["cuda", "mps", "cpu"])
+@pytest.mark.parametrize("sampler", [SDSampler.ddim])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "sd-v1-5-inpainting.safetensors",
+        "v1-5-pruned-emaonly.safetensors",
+        "sd_xl_base_1.0.safetensors",
+        "sd_xl_base_1.0_inpainting_0.1.safetensors",
+    ],
+)
+def test_local_file_path(device, sampler, name):
+    sd_steps = check_device(device)
     model = ModelManager(
-        name="sd1.5",
-        device=torch.device(sd_device),
-        hf_access_token="",
-        sd_run_local=True,
+        name=name,
+        device=torch.device(device),
         disable_nsfw=True,
         sd_cpu_textencoder=False,
-        cpu_offload=True,
-        sd_local_model_path="/Users/cwq/data/models/sd-v1-5-inpainting.ckpt",
+        cpu_offload=False,
     )
     cfg = get_config(
-        HDStrategy.ORIGINAL,
+        strategy=HDStrategy.ORIGINAL,
         prompt="a fox sitting on a bench",
         sd_steps=sd_steps,
     )
     cfg.sd_sampler = sampler
 
-    name = f"device_{sd_device}_{sampler}"
+    name = f"device_{device}_{sampler}_{name}"
+
+    is_sdxl = "sd_xl" in name
 
     assert_equal(
         model,
@@ -238,4 +264,6 @@ def test_local_file_path(sd_device, sampler):
         f"sd_local_model_{name}.png",
         img_p=current_dir / "overture-creations-5sI6fQgYIuo.png",
         mask_p=current_dir / "overture-creations-5sI6fQgYIuo_mask.png",
+        fx=1.5 if is_sdxl else 1,
+        fy=1.5 if is_sdxl else 1,
     )

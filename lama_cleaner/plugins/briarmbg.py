@@ -1,13 +1,11 @@
+# copy from: https://huggingface.co/spaces/briaai/BRIA-RMBG-1.4/blob/main/briarmbg.py
 import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from PIL import Image
-
-from iopaint.helper import load_model
-from iopaint.plugins.base_plugin import BasePlugin
-from iopaint.schema import RunPluginRequest
+import numpy as np
+from torchvision.transforms.functional import normalize
 
 
 class REBNCONV(nn.Module):
@@ -29,7 +27,7 @@ class REBNCONV(nn.Module):
 
 ## upsample tensor 'src' to have the same spatial size with tensor 'tar'
 def _upsample_like(src, tar):
-    src = F.interpolate(src, size=tar.shape[2:], mode="bilinear", align_corners=False)
+    src = F.interpolate(src, size=tar.shape[2:], mode="bilinear")
 
     return src
 
@@ -322,9 +320,38 @@ class RSU4F(nn.Module):
         return hx1d + hxin
 
 
-class ISNetDIS(nn.Module):
+class myrebnconv(nn.Module):
+    def __init__(
+        self,
+        in_ch=3,
+        out_ch=1,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        dilation=1,
+        groups=1,
+    ):
+        super(myrebnconv, self).__init__()
+
+        self.conv = nn.Conv2d(
+            in_ch,
+            out_ch,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+        )
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.rl = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.rl(self.bn(self.conv(x)))
+
+
+class BriaRMBG(nn.Module):
     def __init__(self, in_ch=3, out_ch=1):
-        super(ISNetDIS, self).__init__()
+        super(BriaRMBG, self).__init__()
 
         self.conv_in = nn.Conv2d(in_ch, 64, 3, stride=2, padding=1)
         self.pool_in = nn.MaxPool2d(2, stride=2, ceil_mode=True)
@@ -354,12 +381,19 @@ class ISNetDIS(nn.Module):
         self.stage1d = RSU7(128, 16, 64)
 
         self.side1 = nn.Conv2d(64, out_ch, 3, padding=1)
+        self.side2 = nn.Conv2d(64, out_ch, 3, padding=1)
+        self.side3 = nn.Conv2d(128, out_ch, 3, padding=1)
+        self.side4 = nn.Conv2d(256, out_ch, 3, padding=1)
+        self.side5 = nn.Conv2d(512, out_ch, 3, padding=1)
+        self.side6 = nn.Conv2d(512, out_ch, 3, padding=1)
+
+        # self.outconv = nn.Conv2d(6*out_ch,out_ch,1)
 
     def forward(self, x):
         hx = x
 
         hxin = self.conv_in(hx)
-        hx = self.pool_in(hxin)
+        # hx = self.pool_in(hxin)
 
         # stage 1
         hx1 = self.stage1(hxin)
@@ -403,60 +437,76 @@ class ISNetDIS(nn.Module):
         # side output
         d1 = self.side1(hx1d)
         d1 = _upsample_like(d1, x)
-        return d1.sigmoid()
+
+        d2 = self.side2(hx2d)
+        d2 = _upsample_like(d2, x)
+
+        d3 = self.side3(hx3d)
+        d3 = _upsample_like(d3, x)
+
+        d4 = self.side4(hx4d)
+        d4 = _upsample_like(d4, x)
+
+        d5 = self.side5(hx5d)
+        d5 = _upsample_like(d5, x)
+
+        d6 = self.side6(hx6)
+        d6 = _upsample_like(d6, x)
+
+        return [
+            F.sigmoid(d1),
+            F.sigmoid(d2),
+            F.sigmoid(d3),
+            F.sigmoid(d4),
+            F.sigmoid(d5),
+            F.sigmoid(d6),
+        ], [hx1d, hx2d, hx3d, hx4d, hx5d, hx6]
 
 
-# 从小到大
-ANIME_SEG_MODELS = {
-    "url": "https://github.com/Sanster/models/releases/download/isnetis/isnetis.pth",
-    "md5": "5f25479076b73074730ab8de9e8f2051",
-}
+def resize_image(image):
+    image = image.convert("RGB")
+    model_input_size = (1024, 1024)
+    image = image.resize(model_input_size, Image.BILINEAR)
+    return image
 
 
-class AnimeSeg(BasePlugin):
-    # Model from: https://github.com/SkyTNT/anime-segmentation
-    name = "AnimeSeg"
-    support_gen_image = True
-    support_gen_mask = True
+def create_briarmbg_session():
+    from huggingface_hub import hf_hub_download
 
-    def __init__(self):
-        super().__init__()
-        self.model = load_model(
-            ISNetDIS(),
-            ANIME_SEG_MODELS["url"],
-            "cpu",
-            ANIME_SEG_MODELS["md5"],
-        )
+    net = BriaRMBG()
+    model_path = hf_hub_download("briaai/RMBG-1.4", "model.pth")
+    net.load_state_dict(torch.load(model_path, map_location="cpu"))
+    net.eval()
+    return net
 
-    def gen_image(self, rgb_np_img, req: RunPluginRequest) -> np.ndarray:
-        mask = self.forward(rgb_np_img)
-        mask = Image.fromarray(mask, mode="L")
-        h0, w0 = rgb_np_img.shape[0], rgb_np_img.shape[1]
-        empty = Image.new("RGBA", (w0, h0), 0)
-        img = Image.fromarray(rgb_np_img)
-        cutout = Image.composite(img, empty, mask)
-        return np.asarray(cutout)
 
-    def gen_mask(self, rgb_np_img, req: RunPluginRequest) -> np.ndarray:
-        return self.forward(rgb_np_img)
+def briarmbg_process(bgr_np_image, session, only_mask=False):
+    # prepare input
+    orig_bgr_image = Image.fromarray(bgr_np_image)
+    w, h = orig_im_size = orig_bgr_image.size
+    image = resize_image(orig_bgr_image)
+    im_np = np.array(image)
+    im_tensor = torch.tensor(im_np, dtype=torch.float32).permute(2, 0, 1)
+    im_tensor = torch.unsqueeze(im_tensor, 0)
+    im_tensor = torch.divide(im_tensor, 255.0)
+    im_tensor = normalize(im_tensor, [0.5, 0.5, 0.5], [1.0, 1.0, 1.0])
+    # inference
+    result = session(im_tensor)
+    # post process
+    result = torch.squeeze(F.interpolate(result[0][0], size=(h, w), mode="bilinear"), 0)
+    ma = torch.max(result)
+    mi = torch.min(result)
+    result = (result - mi) / (ma - mi)
+    # image to pil
+    im_array = (result * 255).cpu().data.numpy().astype(np.uint8)
 
-    @torch.inference_mode()
-    def forward(self, rgb_np_img):
-        s = 1024
+    mask = np.squeeze(im_array)
+    if only_mask:
+        return mask
 
-        h0, w0 = h, w = rgb_np_img.shape[0], rgb_np_img.shape[1]
-        if h > w:
-            h, w = s, int(s * w / h)
-        else:
-            h, w = int(s * h / w), s
-        ph, pw = s - h, s - w
-        tmpImg = np.zeros([s, s, 3], dtype=np.float32)
-        tmpImg[ph // 2 : ph // 2 + h, pw // 2 : pw // 2 + w] = (
-            cv2.resize(rgb_np_img, (w, h)) / 255
-        )
-        tmpImg = tmpImg.transpose((2, 0, 1))
-        tmpImg = torch.from_numpy(tmpImg).unsqueeze(0).type(torch.FloatTensor)
-        mask = self.model(tmpImg)
-        mask = mask[0, :, ph // 2 : ph // 2 + h, pw // 2 : pw // 2 + w]
-        mask = cv2.resize(mask.cpu().numpy().transpose((1, 2, 0)), (w0, h0))
-        return (mask * 255).astype("uint8")
+    pil_im = Image.fromarray(mask)
+    # paste the mask on the original image
+    new_im = Image.new("RGBA", pil_im.size, (0, 0, 0, 0))
+    new_im.paste(orig_bgr_image, mask=pil_im)
+    rgba_np_img = np.asarray(new_im)
+    return rgba_np_img
