@@ -40,9 +40,11 @@
     - [andregn/Realistic_Vision_V3.0-inpainting](https://huggingface.co/andregn/Realistic_Vision_V3.0-inpainting)
     - [Lykon/dreamshaper-8-inpainting](https://huggingface.co/Lykon/dreamshaper-8-inpainting)
     - [Sanster/anything-4.0-inpainting](https://huggingface.co/Sanster/anything-4.0-inpainting)
-    - [Sanster/PowerPaint-V1-stable-diffusion-inpainting](https://huggingface.co/Sanster/PowerPaint-V1-stable-diffusion-inpainting)
+    - [BrushNet](https://www.iopaint.com/models/diffusion/brushnet)
+    - [PowerPaintV2](https://www.iopaint.com/models/diffusion/powerpaint_v2)
     - [Sanster/AnyText](https://huggingface.co/Sanster/AnyText)
     - [Fantasy-Studio/Paint-by-Example](https://huggingface.co/Fantasy-Studio/Paint-by-Example)
+
 - [Plugins](https://www.iopaint.com/plugins):
   - [Segment Anything](https://iopaint.com/plugins/interactive_seg): Accurate and fast Interactive Object Segmentation
   - [RemoveBG](https://iopaint.com/plugins/rembg): Remove image background or generate masks for foreground objects
@@ -104,12 +106,19 @@ You can see more information about the available models and plugins supported by
 
 ## Development
 
-Install [nodejs](https://nodejs.org/en), then install the front-end dependencies.
+Install [nodejs](https://nodejs.org/en), then install the frontend dependencies.
 
 ```bash
 git clone https://github.com/Sanster/IOPaint.git
 cd IOPaint/web_app
 npm install
+npm run build
+cp -r dist/ ../iopaint/web_app
+```
+
+Create a `.env.local` file in `web_app` and fill in the backend IP and port.
+```
+VITE_BACKEND=http://127.0.0.1:8080
 ```
 
 Start front-end development environment
@@ -117,10 +126,12 @@ Start front-end development environment
 npm run dev
 ```
 
-Install back-end requirements and start back-end service
+Install back-end requirements and start backend service
 ```bash
 pip install -r requirements.txt
-python3 main.py --model lama
+python3 main.py start --model lama --port 8080
 ```
 
-Then you can visit `http://localhost:5173/` for development. The front-end code will automatically update after being modified, but the back-end needs to restart the service after modifying the python code.
+Then you can visit `http://localhost:5173/` for development.
+The frontend code will automatically update after being modified,
+but the backend needs to restart the service after modifying the python code.
