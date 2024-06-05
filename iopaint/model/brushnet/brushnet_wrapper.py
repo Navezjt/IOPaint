@@ -2,33 +2,42 @@ import PIL.Image
 import cv2
 import torch
 from loguru import logger
+import numpy as np
 
-from .base import DiffusionInpaintModel
-from .helper.cpu_text_encoder import CPUTextEncoderWrapper
-from .original_sd_configs import get_config_files
-from .utils import (
+from ..base import DiffusionInpaintModel
+from ..helper.cpu_text_encoder import CPUTextEncoderWrapper
+from ..original_sd_configs import get_config_files
+from ..utils import (
     handle_from_pretrained_exceptions,
     get_torch_dtype,
     enable_low_mem,
     is_local_files_only,
 )
-from iopaint.schema import InpaintRequest, ModelType
+from .brushnet import BrushNetModel
+from .brushnet_unet_forward import brushnet_unet_forward
+from .unet_2d_blocks import CrossAttnDownBlock2D_forward, DownBlock2D_forward, CrossAttnUpBlock2D_forward, \
+    UpBlock2D_forward
+from ...schema import InpaintRequest, ModelType
 
 
-class SD(DiffusionInpaintModel):
+class BrushNetWrapper(DiffusionInpaintModel):
     pad_mod = 8
     min_size = 512
-    lcm_lora_id = "latent-consistency/lcm-lora-sdv1-5"
 
     def init_model(self, device: torch.device, **kwargs):
-        from diffusers.pipelines.stable_diffusion import StableDiffusionInpaintPipeline
+        from .pipeline_brushnet import StableDiffusionBrushNetPipeline
+        self.model_info = kwargs["model_info"]
+        self.brushnet_method = kwargs["brushnet_method"]
 
         use_gpu, torch_dtype = get_torch_dtype(device, kwargs.get("no_half", False))
+        self.torch_dtype = torch_dtype
 
         model_kwargs = {
             **kwargs.get("pipe_components", {}),
             "local_files_only": is_local_files_only(**kwargs),
         }
+        self.local_files_only = model_kwargs["local_files_only"]
+
         disable_nsfw_checker = kwargs["disable_nsfw"] or kwargs.get(
             "cpu_offload", False
         )
@@ -42,25 +51,30 @@ class SD(DiffusionInpaintModel):
                 )
             )
 
+        logger.info(f"Loading BrushNet model from {self.brushnet_method}")
+        brushnet = BrushNetModel.from_pretrained(self.brushnet_method, torch_dtype=torch_dtype)
+
         if self.model_info.is_single_file_diffusers:
             if self.model_info.model_type == ModelType.DIFFUSERS_SD:
                 model_kwargs["num_in_channels"] = 4
             else:
                 model_kwargs["num_in_channels"] = 9
 
-            self.model = StableDiffusionInpaintPipeline.from_single_file(
+            self.model = StableDiffusionBrushNetPipeline.from_single_file(
                 self.model_id_or_path,
                 torch_dtype=torch_dtype,
                 load_safety_checker=not disable_nsfw_checker,
                 original_config_file=get_config_files()['v1'],
+                brushnet=brushnet,
                 **model_kwargs,
             )
         else:
             self.model = handle_from_pretrained_exceptions(
-                StableDiffusionInpaintPipeline.from_pretrained,
+                StableDiffusionBrushNetPipeline.from_pretrained,
                 pretrained_model_name_or_path=self.model_id_or_path,
                 variant="fp16",
                 torch_dtype=torch_dtype,
+                brushnet=brushnet,
                 **model_kwargs,
             )
 
@@ -79,6 +93,37 @@ class SD(DiffusionInpaintModel):
 
         self.callback = kwargs.pop("callback", None)
 
+        # Monkey patch the forward method of the UNet to use the brushnet_unet_forward method
+        self.model.unet.forward = brushnet_unet_forward.__get__(self.model.unet, self.model.unet.__class__)
+
+        for down_block in self.model.brushnet.down_blocks:
+            down_block.forward = DownBlock2D_forward.__get__(down_block, down_block.__class__)
+        for up_block in self.model.brushnet.up_blocks:
+            up_block.forward = UpBlock2D_forward.__get__(up_block, up_block.__class__)
+
+        # Monkey patch unet down_blocks to use CrossAttnDownBlock2D_forward
+        for down_block in self.model.unet.down_blocks:
+            if down_block.__class__.__name__ == "CrossAttnDownBlock2D":
+                down_block.forward = CrossAttnDownBlock2D_forward.__get__(down_block, down_block.__class__)
+            else:
+                down_block.forward = DownBlock2D_forward.__get__(down_block, down_block.__class__)
+
+        for up_block in self.model.unet.up_blocks:
+            if up_block.__class__.__name__ == "CrossAttnUpBlock2D":
+                up_block.forward = CrossAttnUpBlock2D_forward.__get__(up_block, up_block.__class__)
+            else:
+                up_block.forward = UpBlock2D_forward.__get__(up_block, up_block.__class__)
+
+    def switch_brushnet_method(self, new_method: str):
+        self.brushnet_method = new_method
+        brushnet = BrushNetModel.from_pretrained(
+            new_method,
+            resume_download=True,
+            local_files_only=self.local_files_only,
+            torch_dtype=self.torch_dtype,
+        ).to(self.model.device)
+        self.model.brushnet = brushnet
+
     def forward(self, image, mask, config: InpaintRequest):
         """Input image and output image have same size
         image: [H, W, C] RGB
@@ -88,42 +133,25 @@ class SD(DiffusionInpaintModel):
         self.set_scheduler(config)
 
         img_h, img_w = image.shape[:2]
-
+        normalized_mask = mask[:, :].astype("float32") / 255.0
+        image = image * (1 - normalized_mask)
+        image = image.astype(np.uint8)
         output = self.model(
             image=PIL.Image.fromarray(image),
             prompt=config.prompt,
             negative_prompt=config.negative_prompt,
-            mask_image=PIL.Image.fromarray(mask[:, :, -1], mode="L"),
+            mask=PIL.Image.fromarray(mask[:, :, -1], mode="L").convert("RGB"),
             num_inference_steps=config.sd_steps,
-            strength=config.sd_strength,
+            # strength=config.sd_strength,
             guidance_scale=config.sd_guidance_scale,
             output_type="np",
             callback_on_step_end=self.callback,
             height=img_h,
             width=img_w,
             generator=torch.manual_seed(config.sd_seed),
+            brushnet_conditioning_scale=config.brushnet_conditioning_scale,
         ).images[0]
 
         output = (output * 255).round().astype("uint8")
         output = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
         return output
-
-
-class SD15(SD):
-    name = "runwayml/stable-diffusion-inpainting"
-    model_id_or_path = "runwayml/stable-diffusion-inpainting"
-
-
-class Anything4(SD):
-    name = "Sanster/anything-4.0-inpainting"
-    model_id_or_path = "Sanster/anything-4.0-inpainting"
-
-
-class RealisticVision14(SD):
-    name = "Sanster/Realistic_Vision_V1.4-inpainting"
-    model_id_or_path = "Sanster/Realistic_Vision_V1.4-inpainting"
-
-
-class SD2(SD):
-    name = "stabilityai/stable-diffusion-2-inpainting"
-    model_id_or_path = "stabilityai/stable-diffusion-2-inpainting"
