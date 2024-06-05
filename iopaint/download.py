@@ -1,7 +1,8 @@
+import glob
 import json
 import os
 from functools import lru_cache
-from typing import List
+from typing import List, Optional
 
 from iopaint.schema import ModelType, ModelInfo
 from loguru import logger
@@ -25,11 +26,11 @@ def cli_download_model(model: str):
     if model in models and models[model].is_erase_model:
         logger.info(f"Downloading {model}...")
         models[model].download()
-        logger.info(f"Done.")
+        logger.info("Done.")
     elif model == ANYTEXT_NAME:
         logger.info(f"Downloading {model}...")
         models[model].download()
-        logger.info(f"Done.")
+        logger.info("Done.")
     else:
         logger.info(f"Downloading model from Huggingface: {model}")
         from diffusers import DiffusionPipeline
@@ -48,7 +49,7 @@ def folder_name_to_show_name(name: str) -> str:
 
 
 @lru_cache(maxsize=512)
-def get_sd_model_type(model_abs_path: str) -> ModelType:
+def get_sd_model_type(model_abs_path: str) -> Optional[ModelType]:
     if "inpaint" in Path(model_abs_path).name.lower():
         model_type = ModelType.DIFFUSERS_SD_INPAINT
     else:
@@ -60,19 +61,23 @@ def get_sd_model_type(model_abs_path: str) -> ModelType:
                 model_abs_path,
                 load_safety_checker=False,
                 num_in_channels=9,
-                config_files=get_config_files(),
+                original_config_file=get_config_files()['v1']
             )
             model_type = ModelType.DIFFUSERS_SD_INPAINT
         except ValueError as e:
-            if "Trying to set a tensor of shape torch.Size([320, 4, 3, 3])" in str(e):
+            if "[320, 4, 3, 3]" in str(e):
                 model_type = ModelType.DIFFUSERS_SD
             else:
-                raise e
+                logger.info(f"Ignore non sdxl file: {model_abs_path}")
+                return
+        except Exception as e:
+            logger.error(f"Failed to load {model_abs_path}: {e}")
+            return
     return model_type
 
 
 @lru_cache()
-def get_sdxl_model_type(model_abs_path: str) -> ModelType:
+def get_sdxl_model_type(model_abs_path: str) -> Optional[ModelType]:
     if "inpaint" in model_abs_path:
         model_type = ModelType.DIFFUSERS_SDXL_INPAINT
     else:
@@ -84,7 +89,7 @@ def get_sdxl_model_type(model_abs_path: str) -> ModelType:
                 model_abs_path,
                 load_safety_checker=False,
                 num_in_channels=9,
-                config_files=get_config_files(),
+                original_config_file=get_config_files()['xl'],
             )
             if model.unet.config.in_channels == 9:
                 # https://github.com/huggingface/diffusers/issues/6610
@@ -92,10 +97,14 @@ def get_sdxl_model_type(model_abs_path: str) -> ModelType:
             else:
                 model_type = ModelType.DIFFUSERS_SDXL
         except ValueError as e:
-            if "Trying to set a tensor of shape torch.Size([320, 4, 3, 3])" in str(e):
+            if "[320, 4, 3, 3]" in str(e):
                 model_type = ModelType.DIFFUSERS_SDXL
             else:
-                raise e
+                logger.info(f"Ignore non sdxl file: {model_abs_path}")
+                return
+        except Exception as e:
+            logger.error(f"Failed to load {model_abs_path}: {e}")
+            return
     return model_type
 
 
@@ -113,13 +122,16 @@ def scan_single_file_diffusion_models(cache_dir) -> List[ModelInfo]:
             pass
 
     res = []
-    for it in stable_diffusion_dir.glob(f"*.*"):
+    for it in stable_diffusion_dir.glob("*.*"):
         if it.suffix not in [".safetensors", ".ckpt"]:
             continue
         model_abs_path = str(it.absolute())
         model_type = model_type_cache.get(it.name)
         if model_type is None:
             model_type = get_sd_model_type(model_abs_path)
+        if model_type is None:
+            continue
+
         model_type_cache[it.name] = model_type
         res.append(
             ModelInfo(
@@ -144,13 +156,16 @@ def scan_single_file_diffusion_models(cache_dir) -> List[ModelInfo]:
         except:
             pass
 
-    for it in stable_diffusion_xl_dir.glob(f"*.*"):
+    for it in stable_diffusion_xl_dir.glob("*.*"):
         if it.suffix not in [".safetensors", ".ckpt"]:
             continue
         model_abs_path = str(it.absolute())
         model_type = sdxl_model_type_cache.get(it.name)
         if model_type is None:
             model_type = get_sdxl_model_type(model_abs_path)
+        if model_type is None:
+            continue
+
         sdxl_model_type_cache[it.name] = model_type
         if stable_diffusion_xl_dir.exists():
             with open(sdxl_cache_file, "w", encoding="utf-8") as fw:
@@ -192,7 +207,9 @@ def scan_diffusers_models() -> List[ModelInfo]:
     cache_dir = Path(HF_HUB_CACHE)
     # logger.info(f"Scanning diffusers models in {cache_dir}")
     diffusers_model_names = []
-    for it in cache_dir.glob("**/*/model_index.json"):
+    model_index_files = glob.glob(os.path.join(cache_dir, "**/*", "model_index.json"), recursive=True)
+    for it in model_index_files:
+        it = Path(it)
         with open(it, "r", encoding="utf-8") as f:
             try:
                 data = json.load(f)
@@ -238,7 +255,9 @@ def _scan_converted_diffusers_models(cache_dir) -> List[ModelInfo]:
     cache_dir = Path(cache_dir)
     available_models = []
     diffusers_model_names = []
-    for it in cache_dir.glob("**/*/model_index.json"):
+    model_index_files = glob.glob(os.path.join(cache_dir, "**/*", "model_index.json"), recursive=True)
+    for it in model_index_files:
+        it = Path(it)
         with open(it, "r", encoding="utf-8") as f:
             try:
                 data = json.load(f)
